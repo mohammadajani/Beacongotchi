@@ -17,9 +17,11 @@ Requires: pip3 install flask --break-system-packages
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
+from datetime import datetime
 
 from flask import Flask, request, jsonify, send_file, Response
 from PIL import Image
@@ -31,6 +33,11 @@ WIFI_CSV = os.path.join(BASE_DIR, "wifi_log.csv")
 BT_CSV = os.path.join(BASE_DIR, "bt_log.csv")
 CUSTOM_BLACK_PATH = os.path.join(BASE_DIR, "custom_black.png")
 CUSTOM_RED_PATH = os.path.join(BASE_DIR, "custom_red.png")
+
+# Must match SERIAL_PORT in pi_eink_display_mvp.py - used here only to
+# report link status on the Network tab, not to open the port ourselves.
+SERIAL_PORT = "/dev/ttyUSB0"
+GPS_STALE_AFTER = 30  # seconds, for the Network tab's GPS status indicator
 
 # Panel resolution for the 2.13" B (red/black/white) model, landscape
 # orientation - matches the capture script's Image.new("1", (epd.height,
@@ -114,6 +121,111 @@ def tail_csv(path, n=25):
     return {"header": header, "rows": rows}
 
 
+def read_all_rows(path):
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        lines = [l.strip() for l in f.readlines() if l.strip()]
+    return [l.split(",") for l in lines[1:]]  # skip header
+
+
+def compute_cumulative(path, key_idx):
+    """Step series of unique-value count over time, e.g. unique SSIDs seen so far."""
+    seen = set()
+    series = []
+    for row in read_all_rows(path):
+        if len(row) <= key_idx:
+            continue
+        key = row[key_idx] or "(hidden)"
+        if key not in seen:
+            seen.add(key)
+            series.append({"t": row[0], "count": len(seen)})
+    return series
+
+
+def collect_gps_points(limit_per_source=300):
+    points = []
+    # wifi_log.csv: timestamp, ssid, rssi, encryption, lat, lon
+    for row in read_all_rows(WIFI_CSV)[-limit_per_source:]:
+        if len(row) < 6 or not row[4] or not row[5]:
+            continue
+        try:
+            points.append({"lat": float(row[4]), "lon": float(row[5]), "type": "wifi", "label": row[1] or "(hidden)"})
+        except ValueError:
+            continue
+    # bt_log.csv: timestamp, mac, rssi, lat, lon
+    for row in read_all_rows(BT_CSV)[-limit_per_source:]:
+        if len(row) < 5 or not row[3] or not row[4]:
+            continue
+        try:
+            points.append({"lat": float(row[3]), "lon": float(row[4]), "type": "bt", "label": row[1]})
+        except ValueError:
+            continue
+    return points
+
+
+def build_wifi_inventory(limit=500):
+    inv = {}
+    for row in read_all_rows(WIFI_CSV)[-limit:]:
+        if len(row) < 4:
+            continue
+        ts, ssid, rssi, encryption = row[0], row[1] or "(hidden)", row[2], row[3]
+        entry = inv.setdefault(ssid, {"ssid": ssid, "first_seen": ts, "times_seen": 0})
+        entry["last_seen"] = ts
+        entry["last_rssi"] = rssi
+        entry["encryption"] = encryption or entry.get("encryption", "")
+        entry["times_seen"] += 1
+    return sorted(inv.values(), key=lambda e: e["last_seen"], reverse=True)
+
+
+def build_bt_inventory(limit=500):
+    inv = {}
+    for row in read_all_rows(BT_CSV)[-limit:]:
+        if len(row) < 2:
+            continue
+        ts, mac = row[0], row[1]
+        rssi = row[2] if len(row) > 2 else ""
+        entry = inv.setdefault(mac, {"mac": mac, "first_seen": ts, "times_seen": 0})
+        entry["last_seen"] = ts
+        entry["last_rssi"] = rssi
+        entry["times_seen"] += 1
+    return sorted(inv.values(), key=lambda e: e["last_seen"], reverse=True)
+
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "unknown"
+
+
+def get_gps_status():
+    """Looks at whichever CSV has the more recent row to judge live GPS state."""
+    latest_ts, latest_has_fix = None, False
+    for path, lat_idx in [(WIFI_CSV, 4), (BT_CSV, 3)]:
+        rows = tail_csv(path, 1)["rows"]
+        if not rows:
+            continue
+        row = rows[0]
+        try:
+            ts = datetime.fromisoformat(row[0])
+        except (ValueError, IndexError):
+            continue
+        if latest_ts is None or ts > latest_ts:
+            latest_ts = ts
+            latest_has_fix = len(row) > lat_idx and bool(row[lat_idx])
+    if latest_ts is None:
+        return {"status": "unknown", "last_update": None}
+    age = (datetime.now() - latest_ts).total_seconds()
+    if age > GPS_STALE_AFTER:
+        return {"status": "stale", "last_update": latest_ts.isoformat()}
+    return {"status": "ok" if latest_has_fix else "no_fix", "last_update": latest_ts.isoformat()}
+
+
 # ---------------- API ----------------
 
 @app.route("/api/status")
@@ -125,6 +237,34 @@ def api_status():
 def api_logs():
     n = int(request.args.get("n", 25))
     return jsonify({"wifi": tail_csv(WIFI_CSV, n), "bt": tail_csv(BT_CSV, n)})
+
+
+@app.route("/api/history")
+def api_history():
+    return jsonify({
+        "wifi": compute_cumulative(WIFI_CSV, key_idx=1),
+        "bt": compute_cumulative(BT_CSV, key_idx=1),
+    })
+
+
+@app.route("/api/gps_points")
+def api_gps_points():
+    return jsonify({"points": collect_gps_points()})
+
+
+@app.route("/api/network")
+def api_network():
+    return jsonify({
+        "wifi_inventory": build_wifi_inventory(),
+        "bt_inventory": build_bt_inventory(),
+        "system": {
+            "pi_ip": get_local_ip(),
+            "serial_port": SERIAL_PORT,
+            "serial_connected": os.path.exists(SERIAL_PORT),
+            "gps": get_gps_status(),
+            "capture": capture_status(),
+        },
+    })
 
 
 @app.route("/api/settings", methods=["GET", "POST"])
@@ -250,85 +390,156 @@ DASHBOARD_HTML = """<!doctype html>
   .note { font-size: 12px; color: #555; }
   button { padding: 6px 14px; margin-top: 8px; cursor: pointer; }
   .log-scroll { max-height: 400px; overflow-y: auto; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 15px; border-bottom: 2px solid #333; }
+  .tab-btn { padding: 8px 16px; cursor: pointer; border: 1px solid #ccc; border-bottom: none; background: #eee; border-radius: 6px 6px 0 0; }
+  .tab-btn.active { background: #fff; font-weight: bold; border-color: #333; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+  canvas { border: 1px solid #ccc; max-width: 100%; }
+  .legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; }
+  .status-ok { color: green; font-weight: bold; }
+  .status-no_fix, .status-stale, .status-unknown { color: #a60; font-weight: bold; }
 </style>
 </head>
 <body>
 <h1>Wardrive Dashboard</h1>
 <p>Capture script status: <span id="status">...</span></p>
 
-<fieldset>
-  <legend>Display refresh settings</legend>
-  <label>Refresh mode:
-    <select id="refresh_mode">
-      <option value="immediate">Immediate - update as soon as WiFi/BT counts change</option>
-      <option value="interval">Interval - update at most every N seconds</option>
-      <option value="off">Off - freeze the display and show a blank/graphic instead</option>
-    </select>
-  </label>
-  <br><br>
-  <label>Interval (seconds, used when mode = interval):
-    <input type="number" id="refresh_interval" min="5" value="60" style="width:80px">
-  </label>
-  <br><br>
-  <label>When mode = off, show:
-    <select id="blank_content">
-      <option value="white">Blank white</option>
-      <option value="black">Blank black</option>
-      <option value="custom">Uploaded graphic (see below)</option>
-    </select>
-  </label>
-  <br><br>
-  <button onclick="saveSettings()">Save settings</button>
-  <span id="settings_saved"></span>
-  <p class="note">Capture (BW16 scanning + CSV logging) keeps running in the background regardless of these settings - this only controls what the e-paper panel shows.</p>
-</fieldset>
+<div class="tabs">
+  <div class="tab-btn active" id="btn-logs" onclick="showTab('logs')">Logs</div>
+  <div class="tab-btn" id="btn-visualize" onclick="showTab('visualize')">Visualize</div>
+  <div class="tab-btn" id="btn-network" onclick="showTab('network')">Network</div>
+  <div class="tab-btn" id="btn-settings" onclick="showTab('settings')">Settings</div>
+</div>
 
-<fieldset>
-  <legend>Upload display graphic</legend>
-  <p class="note">
-    The panel is 250x122 pixels and only supports <b>3 colors: white, black, and red</b> - no grayscale or gradients.
-    Any image you upload (PNG, JPG, BMP, GIF) is resized to fit (padded with white, never stretched or cropped)
-    and every pixel is snapped to the nearest of those 3 colors. Simple logos, line art, or high-contrast
-    graphics work best; photos will look rough/dithered. This only appears when refresh mode is "Off" and
-    "When off, show" is set to "Uploaded graphic".
-  </p>
-  <input type="file" id="image_file" accept="image/*">
-  <button onclick="uploadImage()">Upload</button>
-  <span id="image_status"></span>
-</fieldset>
-
-<fieldset>
-  <legend>Update capture script</legend>
-  <p class="note">
-    Upload a new pi_eink_display_mvp.py to replace the running one. It's syntax-checked before being
-    applied, the previous version is kept as a .bak file alongside it, and the capture process restarts
-    automatically once the update is applied.
-  </p>
-  <input type="file" id="script_file" accept=".py">
-  <button onclick="uploadScript()">Upload &amp; restart</button>
-  <span id="script_status"></span>
-</fieldset>
-
-<fieldset>
-  <legend>Export logs</legend>
-  <a href="/api/export/wifi">Download wifi_log.csv</a> &nbsp;|&nbsp;
-  <a href="/api/export/bt">Download bt_log.csv</a>
-  <br><br>
-  <button onclick="restartCapture()">Restart capture script manually</button>
-</fieldset>
-
-<div class="row">
-  <div class="col">
-    <h2>Live WiFi log</h2>
-    <div class="log-scroll"><table id="wifi_table"><thead></thead><tbody></tbody></table></div>
-  </div>
-  <div class="col">
-    <h2>Live Bluetooth log</h2>
-    <div class="log-scroll"><table id="bt_table"><thead></thead><tbody></tbody></table></div>
+<div class="tab-content active" id="tab-logs">
+  <div class="row">
+    <div class="col">
+      <h2>Live WiFi log</h2>
+      <div class="log-scroll"><table id="wifi_table"><thead></thead><tbody></tbody></table></div>
+    </div>
+    <div class="col">
+      <h2>Live Bluetooth log</h2>
+      <div class="log-scroll"><table id="bt_table"><thead></thead><tbody></tbody></table></div>
+    </div>
   </div>
 </div>
 
+<div class="tab-content" id="tab-visualize">
+  <h2>Unique devices seen over time</h2>
+  <p class="note">Step chart of cumulative unique SSIDs/MACs seen since the capture script started (or since the CSVs were last cleared).</p>
+  <canvas id="history_chart" width="900" height="260"></canvas>
+  <p>
+    <span class="legend-dot" style="background:#1976d2"></span>WiFi
+    &nbsp;&nbsp;<span class="legend-dot" style="background:#c2185b"></span>Bluetooth
+  </p>
+
+  <h2>GPS-tagged capture positions</h2>
+  <p class="note">
+    Relative-position plot of every capture that had a GPS fix at the time - not a real map with tiles
+    (no internet dependency assumed in the field). Axes are plain lat/lon, scaled to fit.
+  </p>
+  <canvas id="gps_plot" width="900" height="400"></canvas>
+  <p>
+    <span class="legend-dot" style="background:#1976d2"></span>WiFi
+    &nbsp;&nbsp;<span class="legend-dot" style="background:#c2185b"></span>Bluetooth
+  </p>
+</div>
+
+<div class="tab-content" id="tab-network">
+  <h2>System status</h2>
+  <table>
+    <tr><th>Pi IP</th><td id="net_pi_ip">-</td></tr>
+    <tr><th>BW16 serial port</th><td id="net_serial">-</td></tr>
+    <tr><th>GPS</th><td id="net_gps">-</td></tr>
+    <tr><th>Capture process</th><td id="net_capture">-</td></tr>
+  </table>
+
+  <div class="row" style="margin-top:20px">
+    <div class="col">
+      <h2>WiFi network inventory</h2>
+      <div class="log-scroll"><table id="wifi_inv_table"><thead></thead><tbody></tbody></table></div>
+    </div>
+    <div class="col">
+      <h2>Bluetooth device inventory</h2>
+      <div class="log-scroll"><table id="bt_inv_table"><thead></thead><tbody></tbody></table></div>
+    </div>
+  </div>
+</div>
+
+<div class="tab-content" id="tab-settings">
+  <fieldset>
+    <legend>Display refresh settings</legend>
+    <label>Refresh mode:
+      <select id="refresh_mode">
+        <option value="immediate">Immediate - update as soon as WiFi/BT counts change</option>
+        <option value="interval">Interval - update at most every N seconds</option>
+        <option value="off">Off - freeze the display and show a blank/graphic instead</option>
+      </select>
+    </label>
+    <br><br>
+    <label>Interval (seconds, used when mode = interval):
+      <input type="number" id="refresh_interval" min="5" value="60" style="width:80px">
+    </label>
+    <br><br>
+    <label>When mode = off, show:
+      <select id="blank_content">
+        <option value="white">Blank white</option>
+        <option value="black">Blank black</option>
+        <option value="custom">Uploaded graphic (see below)</option>
+      </select>
+    </label>
+    <br><br>
+    <button onclick="saveSettings()">Save settings</button>
+    <span id="settings_saved"></span>
+    <p class="note">Capture (BW16 scanning + CSV logging) keeps running in the background regardless of these settings - this only controls what the e-paper panel shows.</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Upload display graphic</legend>
+    <p class="note">
+      The panel is 250x122 pixels and only supports <b>3 colors: white, black, and red</b> - no grayscale or gradients.
+      Any image you upload (PNG, JPG, BMP, GIF) is resized to fit (padded with white, never stretched or cropped)
+      and every pixel is snapped to the nearest of those 3 colors. Simple logos, line art, or high-contrast
+      graphics work best; photos will look rough/dithered. This only appears when refresh mode is "Off" and
+      "When off, show" is set to "Uploaded graphic".
+    </p>
+    <input type="file" id="image_file" accept="image/*">
+    <button onclick="uploadImage()">Upload</button>
+    <span id="image_status"></span>
+  </fieldset>
+
+  <fieldset>
+    <legend>Update capture script</legend>
+    <p class="note">
+      Upload a new pi_eink_display_mvp.py to replace the running one. It's syntax-checked before being
+      applied, the previous version is kept as a .bak file alongside it, and the capture process restarts
+      automatically once the update is applied.
+    </p>
+    <input type="file" id="script_file" accept=".py">
+    <button onclick="uploadScript()">Upload &amp; restart</button>
+    <span id="script_status"></span>
+  </fieldset>
+
+  <fieldset>
+    <legend>Export logs</legend>
+    <a href="/api/export/wifi">Download wifi_log.csv</a> &nbsp;|&nbsp;
+    <a href="/api/export/bt">Download bt_log.csv</a>
+    <br><br>
+    <button onclick="restartCapture()">Restart capture script manually</button>
+  </fieldset>
+</div>
+
 <script>
+function showTab(name) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById('btn-' + name).classList.add('active');
+  if (name === 'visualize') { refreshHistory(); refreshGpsPlot(); }
+  if (name === 'network') { refreshNetwork(); }
+}
+
 async function refreshStatus() {
   const r = await fetch('/api/status');
   const d = await r.json();
@@ -357,6 +568,113 @@ async function refreshLogs() {
   const d = await r.json();
   fillTable('wifi_table', d.wifi);
   fillTable('bt_table', d.bt);
+}
+
+function drawStepChart(canvasId, wifiSeries, btSeries) {
+  const canvas = document.getElementById(canvasId);
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const maxLen = Math.max(wifiSeries.length, btSeries.length);
+  if (maxLen === 0) {
+    ctx.fillStyle = '#777';
+    ctx.fillText('No data yet', 10, 20);
+    return;
+  }
+  const maxCount = Math.max(1, ...wifiSeries.map(p => p.count), ...btSeries.map(p => p.count));
+  const pad = 25;
+  const w = canvas.width - pad * 2, h = canvas.height - pad * 2;
+
+  function drawSeries(series, color) {
+    if (series.length === 0) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    series.forEach((p, i) => {
+      const x = pad + (i / Math.max(series.length - 1, 1)) * w;
+      const y = pad + h - (p.count / maxCount) * h;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle = '#ddd';
+  ctx.strokeRect(pad, pad, w, h);
+  ctx.fillStyle = '#333';
+  ctx.fillText(String(maxCount), 2, pad + 4);
+  ctx.fillText('0', 10, pad + h);
+
+  drawSeries(wifiSeries, '#1976d2');
+  drawSeries(btSeries, '#c2185b');
+}
+
+async function refreshHistory() {
+  const r = await fetch('/api/history');
+  const d = await r.json();
+  drawStepChart('history_chart', d.wifi, d.bt);
+}
+
+function drawGpsPlot(canvasId, points) {
+  const canvas = document.getElementById(canvasId);
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!points.length) {
+    ctx.fillStyle = '#777';
+    ctx.fillText('No GPS-tagged captures yet', 10, 20);
+    return;
+  }
+  const lats = points.map(p => p.lat), lons = points.map(p => p.lon);
+  const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons), maxLon = Math.max(...lons);
+  const pad = 20;
+  const w = canvas.width - pad * 2, h = canvas.height - pad * 2;
+
+  function project(lat, lon) {
+    const nx = maxLon === minLon ? 0.5 : (lon - minLon) / (maxLon - minLon);
+    const ny = maxLat === minLat ? 0.5 : (lat - minLat) / (maxLat - minLat);
+    return [pad + nx * w, pad + h - ny * h];
+  }
+
+  ctx.strokeStyle = '#ddd';
+  ctx.strokeRect(pad, pad, w, h);
+
+  points.forEach(p => {
+    const [x, y] = project(p.lat, p.lon);
+    ctx.fillStyle = p.type === 'wifi' ? '#1976d2' : '#c2185b';
+    ctx.beginPath();
+    ctx.arc(x, y, 3, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+async function refreshGpsPlot() {
+  const r = await fetch('/api/gps_points');
+  const d = await r.json();
+  drawGpsPlot('gps_plot', d.points);
+}
+
+function fillInventoryTable(tableId, rows, columns) {
+  const table = document.getElementById(tableId);
+  const thead = table.querySelector('thead');
+  const tbody = table.querySelector('tbody');
+  thead.innerHTML = '<tr>' + columns.map(c => '<th>' + c + '</th>').join('') + '</tr>';
+  tbody.innerHTML = rows.map(
+    row => '<tr>' + columns.map(c => '<td>' + (row[c] ?? '') + '</td>').join('') + '</tr>'
+  ).join('');
+}
+
+async function refreshNetwork() {
+  const r = await fetch('/api/network');
+  const d = await r.json();
+
+  document.getElementById('net_pi_ip').textContent = d.system.pi_ip;
+  document.getElementById('net_serial').textContent = d.system.serial_port + (d.system.serial_connected ? ' (connected)' : ' (not found)');
+  const gpsEl = document.getElementById('net_gps');
+  gpsEl.textContent = d.system.gps.status + (d.system.gps.last_update ? (' - last update ' + d.system.gps.last_update) : '');
+  gpsEl.className = 'status-' + d.system.gps.status;
+  document.getElementById('net_capture').textContent = d.system.capture;
+
+  fillInventoryTable('wifi_inv_table', d.wifi_inventory, ['ssid', 'encryption', 'last_rssi', 'times_seen', 'first_seen', 'last_seen']);
+  fillInventoryTable('bt_inv_table', d.bt_inventory, ['mac', 'last_rssi', 'times_seen', 'first_seen', 'last_seen']);
 }
 
 async function saveSettings() {
